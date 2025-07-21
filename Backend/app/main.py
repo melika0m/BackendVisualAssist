@@ -12,6 +12,9 @@ import base64
 # FastAPI app
 app = FastAPI()
 
+@app.get("/")
+async def read_root():
+    return {"message": "Hello, World!"}
 # Load model and processor
 processor = AutoImageProcessor.from_pretrained("ustc-community/dfine-xlarge-coco")
 model = DFineForObjectDetection.from_pretrained("ustc-community/dfine-xlarge-coco")
