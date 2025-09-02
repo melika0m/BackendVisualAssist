@@ -1,12 +1,11 @@
 # main.py
 import time
+from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from PIL import Image
+import torch
 import base64
 from io import BytesIO
-
-import torch
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from PIL import Image, ImageOps
 from transformers import AutoImageProcessor, DFineForObjectDetection
 
 
@@ -51,50 +50,35 @@ class ImageRequest(BaseModel):
 # -----------------------------
 # Inference endpoint (base64)
 # -----------------------------
-@app.post("/detect_objects")
-async def detect_objects(request: ImageRequest):
+@app.post("/detect_objects_multipart")
+async def detect_objects_multipart(file: UploadFile = File(...)):
     try:
-        t0 = time.time()
+        content = await file.read()
+        img = Image.open(BytesIO(content)).convert("RGB")
+        w, h = img.size
 
-        # 1) Decode base64 -> PIL, fix orientation, force RGB
-        img_bytes = base64.b64decode(request.image_data)
-        img = Image.open(BytesIO(img_bytes))
-        img = ImageOps.exif_transpose(img).convert("RGB")
-
-        # 2) Preprocess
         inputs = processor(images=img, return_tensors="pt").to(device)
-
-        # 3) Forward pass
         with torch.no_grad():
             outputs = model(**inputs)
 
-        # 4) Post-process with a relatively low threshold (tune as needed)
-        #    NOTE: target_sizes expects (height, width)
         results = processor.post_process_object_detection(
-            outputs,
-            target_sizes=torch.tensor([img.size[::-1]]).to(device),
-            threshold=0.20,   # try 0.10–0.40 depending on what you see
+            outputs, target_sizes=torch.tensor([[h, w]]).to(device), threshold=0.4
         )
 
         detections = []
         for result in results:
             for score, label, box in zip(result["scores"], result["labels"], result["boxes"]):
-                if score > 0.20:
-                    label_name = model.config.id2label[label.item()]
+                if score > 0.4:
                     x1, y1, x2, y2 = box.to("cpu").numpy().astype(int).tolist()
                     detections.append({
-                        "label": label_name,
+                        "label": model.config.id2label[label.item()],
                         "score": float(score),
                         "bbox": [x1, y1, x2, y2],
                     })
 
-        t1 = time.time()
-        print(f"[DFINE] detections={len(detections)} latency={(t1 - t0):.2f}s size={img.size}")
-
-        return {"detections": detections}
-
+        # Return original image size so the app can scale boxes correctly
+        return {"width": w, "height": h, "detections": detections}
     except Exception as e:
-        print(f"[DFINE][ERROR] {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
