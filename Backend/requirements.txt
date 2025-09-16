@@ -37,5 +37,5 @@ transformers==4.53.1
 typing-inspection==0.4.1
 typing_extensions==4.14.1
 urllib3==2.5.0
-uvicorn==0.35.0
+uvicorn[standard]==0.35.0
 gunicorn
