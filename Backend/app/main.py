@@ -1,14 +1,15 @@
 # main.py
 import json
 import base64
+import time
 from io import BytesIO
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
+
 from PIL import Image
 import torch
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect, Query
 from pydantic import BaseModel
 from transformers import AutoImageProcessor, DFineForObjectDetection
-import time
 
 app = FastAPI(title="D-FINE Object Detection (EN only)")
 
@@ -48,6 +49,7 @@ CLASS_PRIORITY = {
 
 def zone_from_cx(cx: float, W: int) -> str:
     x = cx / max(W, 1)
+    # base boundaries
     if x < 1/3: return "left"
     if x < 2/3: return "center"
     return "right"
@@ -70,7 +72,6 @@ def severity_for(label: str, rng: str) -> str:
     return "low"
 
 def action_suggestion(zone: str, rng: str, label: str) -> str:
-    # Simple guidance rules
     hazard = label in HAZARD_CLASSES
     if hazard:
         if rng == "near":
@@ -81,7 +82,6 @@ def action_suggestion(zone: str, rng: str, label: str) -> str:
             if zone == "center": return "slow"
             if zone == "left":   return "veer_right"
             if zone == "right":  return "veer_left"
-    # non-hazard or far
     if zone == "left":  return "slight_right"
     if zone == "right": return "slight_left"
     return "forward"
@@ -93,13 +93,108 @@ def message_for(label: str, zone: str, rng: str, mode: str) -> str:
         return f"{label} {ztxt}, {rtxt}."
     return f"Caution: {label} {ztxt}, {rtxt}."
 
+def iou(boxA, boxB) -> float:
+    ax1, ay1, ax2, ay2 = boxA
+    bx1, by1, bx2, by2 = boxB
+    inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
+    inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, inter_x2 - inter_x1), max(0, inter_y2 - inter_y1)
+    inter = iw * ih
+    if inter == 0: return 0.0
+    areaA = (ax2-ax1)*(ay2-ay1)
+    areaB = (bx2-bx1)*(by2-by1)
+    return inter / max(1.0, areaA + areaB - inter)
+
+class TrackerLite:
+    """
+    Very small per-connection tracker:
+    - Associate by IoU + same label
+    - Maintain stability count (frames seen)
+    - Zone hysteresis (avoid left/center/right flapping near boundaries)
+    """
+    def __init__(self):
+        self.tracks: List[Dict[str, Any]] = []  # each: {id,label,bbox,zone,range,score,seen,ts}
+        self.next_id = 1
+
+    def _smooth_zone(self, cx: float, W: int, prev_zone: Optional[str]) -> str:
+        # hysteresis: widen the previous zone by ±6% of width to resist jitter
+        x = cx / max(W, 1)
+        if prev_zone == "left":
+            if x < 0.36: return "left"
+            return "center" if x < 0.66 else "right"
+        if prev_zone == "center":
+            if x < 0.30: return "left"
+            if x < 0.70: return "center"
+            return "right"
+        if prev_zone == "right":
+            if x > 0.64: return "right"
+            return "center" if x >= 0.34 else "left"
+        # no previous -> default zoning
+        return zone_from_cx(cx, W)
+
+    def update(self, dets: List[Dict[str, Any]], W: int, H: int) -> List[Dict[str, Any]]:
+        now = time.monotonic()
+        assigned = set()
+        # match
+        for d in dets:
+            best_iou, best_idx = 0.0, -1
+            for idx, tr in enumerate(self.tracks):
+                if idx in assigned: continue
+                if tr["label"] != d["label"]: continue
+                i = iou(tr["bbox"], d["bbox"])
+                if i > best_iou:
+                    best_iou, best_idx = i, idx
+            if best_iou >= 0.5 and best_idx >= 0:
+                tr = self.tracks[best_idx]
+                assigned.add(best_idx)
+                # update track
+                x1,y1,x2,y2 = d["bbox"]
+                cx = (x1+x2)/2
+                zone = self._smooth_zone(cx, W, tr.get("zone"))
+                rng = range_bucket(y1, y2, H)
+                tr.update({
+                    "bbox": d["bbox"], "score": d["score"],
+                    "zone": zone, "range": rng,
+                    "seen": tr.get("seen", 0) + 1, "ts": now
+                })
+                d["track_id"] = tr["id"]
+                d["stable"] = tr["seen"] >= 2
+                d["zone_override"] = zone
+            else:
+                # new track
+                x1,y1,x2,y2 = d["bbox"]
+                cx = (x1+x2)/2
+                zone = zone_from_cx(cx, W)
+                rng = range_bucket(y1, y2, H)
+                tr = {
+                    "id": self.next_id, "label": d["label"],
+                    "bbox": d["bbox"], "zone": zone, "range": rng,
+                    "score": d["score"], "seen": 1, "ts": now
+                }
+                self.next_id += 1
+                self.tracks.append(tr)
+                d["track_id"] = tr["id"]
+                d["stable"] = False
+                d["zone_override"] = zone
+
+        # prune stale (not matched this frame)
+        keep = []
+        for idx, tr in enumerate(self.tracks):
+            if idx in assigned:
+                keep.append(tr)
+            else:
+                # retain briefly (0.6s) to survive single-frame drops
+                if now - tr.get("ts", now) < 0.6:
+                    keep.append(tr)
+        self.tracks = keep
+        return dets
+
 def enrich_detections(
-    dets: List[Dict[str, Any]], W: int, H: int, *, mode: str, fov_deg: float
+    dets: List[Dict[str, Any]], W: int, H: int, *, mode: str, fov_deg: float, only_stable: bool = True
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     enriched = []
     announcements = []
 
-    # sort by priority, score, and box size
     def det_key(d):
         label = d["label"]
         score = d["score"]
@@ -110,8 +205,8 @@ def enrich_detections(
     for d in sorted(dets, key=det_key, reverse=True):
         x1,y1,x2,y2 = d["bbox"]
         cx = (x1 + x2) / 2
-        cy = (y1 + y2) / 2
-        zone = zone_from_cx(cx, W)
+        zone_raw = d.get("zone_override")
+        zone = zone_raw if isinstance(zone_raw, str) else zone_from_cx(cx, W)
         ang  = angle_from_cx(cx, W, fov_deg)
         rng  = range_bucket(y1, y2, H)
         sev  = severity_for(d["label"], rng)
@@ -119,20 +214,32 @@ def enrich_detections(
         msg  = message_for(d["label"], zone, rng, mode)
         enriched.append({
             **d,
-            "position": {"cx": cx, "cy": cy, "zone": zone, "angle_deg": ang},
+            "position": {"cx": cx, "cy": (y1 + y2)/2, "zone": zone, "angle_deg": ang},
             "range": rng,
             "severity": sev,
             "action": act,
             "message": msg
         })
 
-    # announcements: top-K by (priority, severity, score)
+    # announcements prefer stable first
     def ann_key(ed):
         pr = CLASS_PRIORITY.get(ed["label"], 0)
         sev = {"high":2, "medium":1, "low":0}[ed["severity"]]
-        return (pr, sev, ed["score"])
+        st  = 1 if ed.get("stable") else 0
+        return (st, pr, sev, ed["score"])
 
-    top = sorted(enriched, key=ann_key, reverse=True)[:TOPK_DEFAULT]
+    sorted_enriched = sorted(enriched, key=ann_key, reverse=True)
+
+    if only_stable:
+        stable_list = [e for e in sorted_enriched if e.get("stable")]
+        if stable_list:
+            top = stable_list[:TOPK_DEFAULT]
+        else:
+            # fallback to highest priority if nothing stable yet
+            top = sorted_enriched[:1]
+    else:
+        top = sorted_enriched[:TOPK_DEFAULT]
+
     for ed in top:
         announcements.append({
             "label": ed["label"],
@@ -164,7 +271,7 @@ def enrich_detections(
         }
     return enriched, announcements, global_guidance
 
-# -------- REST (multipart) --------
+# -------- REST (kept simple; stateless so no tracking here) --------
 class ImageRequest(BaseModel):
     image_data: str  # kept for compatibility (unused)
 
@@ -201,8 +308,9 @@ async def detect_objects_multipart(
                         "bbox": [x1, y1, x2, y2],
                     })
 
+        # no temporal tracker for REST
         enriched, announcements, global_guidance = enrich_detections(
-            detections, w, h, mode=mode, fov_deg=fov_deg
+            detections, w, h, mode=mode, fov_deg=fov_deg, only_stable=False
         )
 
         resp = {
@@ -216,29 +324,16 @@ async def detect_objects_multipart(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------- WebSocket real-time --------
-# Client -> Server JSON:
-# {
-#   "image_b64": "<base64 JPEG>",
-#   "req_id": "<optional>",
-#   "mode": "verbose|concis",
-#   "min_score": 0.4,
-#   "topk": 3,
-#   "fov_deg": 60.0,
-#   "include_boxes": true
-# }
-# Server -> Client JSON:
-# {
-#   "width": W, "height": H,
-#   "announcements": [...], "global_guidance": {...},
-#   "detections": [...], "req_id": "<same if sent>"
-# }
+# -------- WebSocket with tracker-lite --------
 @app.websocket("/ws_detect")
 async def ws_detect(websocket: WebSocket):
     await websocket.accept()
-    # per-connection cooldown so we don't repeat the exact same phrase too fast
-    last_said = {}  # key: (label, zone, range) -> last_time
+    last_said: Dict[Tuple[str,str,str], float] = {}  # (label, zone, range) -> ts
     COOLDOWN_SEC = 2.5
+    stop_hold_until = 0.0
+
+    tracker = TrackerLite()
+
     try:
         while True:
             msg = await websocket.receive_text()
@@ -256,7 +351,7 @@ async def ws_detect(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"error": "missing image_b64", "req_id": req_id}))
                 continue
 
-            # decode image
+            # decode
             try:
                 img_bytes = base64.b64decode(b64)
                 img = Image.open(BytesIO(img_bytes)).convert("RGB")
@@ -289,12 +384,29 @@ async def ws_detect(websocket: WebSocket):
                             "bbox": [x1, y1, x2, y2],
                         })
 
+            # ---- tracker-lite pass (stability + zone hysteresis)
+            dets = tracker.update(dets, w, h)
+
             enriched, announcements, global_guidance = enrich_detections(
-                dets, w, h, mode=mode, fov_deg=fov_deg
+                dets, w, h, mode=mode, fov_deg=fov_deg, only_stable=True
             )
 
-            # cooldown filter
+            # stop hold (keep "stop" for 1.0s)
             now = time.monotonic()
+            lead_action = None
+            if announcements:
+                lead_action = announcements[0]["action"]
+                if lead_action == "stop":
+                    stop_hold_until = now + 1.0
+            if now < stop_hold_until:
+                # enforce stop in global guidance
+                if global_guidance:
+                    global_guidance["action"] = "stop"
+                    if "message" in global_guidance and isinstance(global_guidance["message"], str):
+                        if not global_guidance["message"].lower().endswith("stop."):
+                            global_guidance["message"] = global_guidance["message"].rstrip() + " Stop."
+
+            # cooldown filter
             cooled = []
             for ann in announcements:
                 key = (ann["label"], ann["zone"], ann["range"])
@@ -327,4 +439,3 @@ async def ws_detect(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
-###ane yeweyli 6ereyt chi 
